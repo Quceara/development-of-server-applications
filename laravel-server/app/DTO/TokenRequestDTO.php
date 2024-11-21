@@ -19,11 +19,13 @@ class TokenRequestDTO
 
     public static function fromRequest($request)
     {
-        $accessToken = $request->cookie('access_token');
-        $refreshToken = $request->cookie('refresh_token');
+        // Извлечение токенов из заголовков
+        $accessToken = $request->header('Authorization') ? str_replace('Bearer ', '', $request->header('Authorization')) : null;
+        $refreshToken = $request->header('X-Refresh-Token');
 
-        $accessTokenExpiresIn = env('ACC_TOKEN_EXP_IN_COOKIE');
-        $refreshTokenExpiresIn = env('REFRESH_TOKEN_EXP_IN_COOKIE');
+        // Получение времени жизни токенов из переменных окружения
+        $accessTokenExpiresIn = env('ACC_TOKEN_EXP_IN_REDIS');
+        $refreshTokenExpiresIn = env('REFRESH_TOKEN_EXP_IN_REDIS');
 
         return new self($accessToken, $refreshToken, $accessTokenExpiresIn, $refreshTokenExpiresIn);
     }

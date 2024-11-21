@@ -27,12 +27,12 @@ class TokenDTO
 
     private function getMaxActiveTokensFromEnv()
     {
-        return env('MAX_ACTIVE_TOKENS');
+        return $this->tokenType == 'access' ? 3 : 1;
     }
 
     private function determineTokenExpiry()
     {
-        return $this->tokenType == 'access' ? env('ACC_TOKEN_EXP_IN_REDIS') : env('REFRESH_TOKEN_EXP_IN_REDIS');
+        return $this->tokenType == 'access' ? /*env('ACC_TOKEN_EXP_IN_REDIS')*/3600 : 8440/*env('REFRESH_TOKEN_EXP_IN_REDIS')*/;
     }
 
     public static function fromRequest($userId, $tokenType)

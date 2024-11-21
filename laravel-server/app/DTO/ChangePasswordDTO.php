@@ -17,7 +17,7 @@ class ChangePasswordDTO
     {
         return new self(
 	    $request->oldPassword,
-	    $request->newPassword
+	    $request->newPassword,
 	);
     }
 }

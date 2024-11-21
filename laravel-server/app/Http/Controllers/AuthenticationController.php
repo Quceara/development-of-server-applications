@@ -10,6 +10,8 @@ use App\Http\Requests\RegisterRequest;
 use App\Http\Resources\RegisterResource;
 use App\DTO\LoginDTO;
 use App\Http\Requests\LoginRequest;
+use App\Http\Requests\Update2faStatusRequest;
+use App\Http\Requests\Verify2faRequest;
 use App\Http\Resources\LoginResource;
 use App\Models\User;
 use Illuminate\Support\Facades\Hash;
@@ -18,150 +20,225 @@ use App\DTO\TokenRequestDTO;
 use App\DTO\TokenDTO;
 use App\Http\Requests\ChangePassword;
 use App\DTO\ChangePasswordDTO;
+use Illuminate\Support\Facades\Mail;
+use Symfony\Component\Mime\Part\TextPart;
 
 class AuthenticationController extends Controller
 {
     public function register(RegisterRequest $request)
     {
-        $registerDTO = RegisterDTO::fromRequest($request);
 
-        $user = User::create([
+    	$registerDTO = RegisterDTO::fromRequest($request);
+
+    	$user = User::create([
             'name' => $registerDTO->name,
             'email' => $registerDTO->email,
             'password' => Hash::make($registerDTO->password)
-        ]);
-        return response()->json(new RegisterResource($user), 201);
+    	]);
+
+    	return response()->json(new RegisterResource($user), 201);
     }
 
-    public function login(LoginRequest $request)
+public function login(LoginRequest $request)
+{
+    $accessToken = $request->header('Authorization');
+    if ($accessToken && str_starts_with($accessToken, 'Bearer ')) {
+        $accessToken = str_replace('Bearer ', '', $accessToken);
+
+        $userIdAccess = Redis::get('access_token:' . $accessToken);
+        if ($userIdAccess) {
+            $this->logout($request);
+        }
+    }
+
+    $loginDTO = LoginDTO::fromRequest($request);
+
+    $user = User::where('email', $loginDTO->email)->first();
+    if (!$user || !Hash::check($loginDTO->password, $user->password)) {
+        return response()->json(['message' => 'Invalid credentials'], 401);
+    }
+
+    if (!$user->is_2fa_enabled) {
+        $newAccessToken = $this->createToken($user->id, 'access');
+        $newRefreshToken = $this->createToken($user->id, 'refresh');
+
+        return response()->json([
+            'refresh_token' => $newRefreshToken,
+            'access_token' => $newAccessToken,
+        ], 200);
+    }
+
+    $rateLimitKey = "2fa:rate_limit:{$user->id}";
+    $requestCount = Redis::get($rateLimitKey);
+
+    if (!$requestCount) {
+        Redis::set($rateLimitKey, 1, 'EX', 30);
+    } else {
+        if ($requestCount >= 3) {
+            return response()->json(['message' => 'Too many requests. Please try again in 30 seconds.'], 429);
+        }
+        Redis::incr($rateLimitKey);
+    }
+
+    $oldKeys = Redis::keys("2fa:{$user->id}:*");
+
+    if (!empty($oldKeys)) {
+
+    	$oldKeys = array_map(function ($k) {
+            return str_replace('laravel_database_', '', $k);
+    	}, $oldKeys);
+
+    	Redis::del($oldKeys);
+    }
+
+    $deviceId = Str::uuid()->toString();
+    $hashedDeviceId = hash('sha256', $deviceId);
+
+    $code = random_int(100000, 999999);
+    $hashedCode = hash('sha256', $code);
+
+    $key = "2fa:{$user->id}:{$hashedDeviceId}";
+    Redis::set($key, json_encode(['code' => $hashedCode]));
+    Redis::expire($key, 300);
+
+    Mail::send([], [], function ($message) use ($user, $code) {
+        $message->to($user->email)
+            ->subject('Your 2FA Code')
+            ->text("Your 2FA code is: {$code}")
+            ->html("<p>Your 2FA code is: <strong>{$code}</strong></p>");
+    });
+
+    return response()->json([
+        'device_id' => $deviceId,
+        'message' => '2FA code sent to your email. Please confirm it to proceed.',
+    ], 200);
+}
+
+    public function verify2fa(Verify2faRequest $request)
     {
-    	$tokenRequestDTO = TokenRequestDTO::fromRequest($request);
-    	$loginDTO = LoginDTO::fromRequest($request);
+    	$deviceId = $request->header('Device-ID');
+    	if (!$deviceId) {
+            return response()->json(['message' => 'Device ID is required'], 400);
+    	}
 
-    	$user = User::where('email', $loginDTO->email)->first();
+    	if (!$code) {
+            return response()->json(['message' => 'Access code is required'], 400);
+    	}
 
-    	if (!Hash::check($loginDTO->password, $user->password)) {
+    	$hashedDeviceId = hash('sha256', $deviceId);
+
+    	$key = "2fa:{$request->attributes->get('userId')}:{$hashedDeviceId}";
+    	$storedCodeData = Redis::get($key);
+
+    	if (!$storedCodeData) {
+            return response()->json(['message' => 'Invalid or expired 2FA code'], 400);
+    	}
+
+    	$storedCodeData = json_decode($storedCodeData, true);
+
+    	if (hash('sha256', $request->code) !== $storedCodeData['code']) {
+            return response()->json(['message' => 'Invalid 2FA code'], 400);
+    	}
+
+    	$userId = $request->attributes->get('userId');
+    	$user = User::find($userId);
+
+    	if (!$user) {
+            return response()->json(['message' => 'User not found'], 404);
+    	}
+
+    	$accessToken = $this->createToken($user->id, 'access');
+    	$refreshToken = $this->createToken($user->id, 'refresh');
+
+        return response()->json([
+            'access_token' => $accessToken,
+            'refresh_token' => $refreshToken,
+    	], 200);
+    }
+
+    public function update2faStatus(Update2faStatusRequest $request)
+    {
+    	$userId = $request->attributes->get('userId');
+
+    	$user = User::find($userId);
+
+    	if (!$user) {
+            return response()->json(['message' => 'User not found'], 404);
+    	}
+
+    	if (!Hash::check($request->password, $user->password)) {
             return response()->json(['message' => 'Invalid password'], 401);
     	}
 
-    	$newAccessToken = $this->createToken($user->id, 'access');
-    	$newRefreshToken = $this->createToken($user->id, 'refresh');
-
-    	if ($tokenRequestDTO->refreshToken) {
-            $this->logout($request);
-    	}
+    	$user->update([
+            'is_2fa_enabled' => $request->is_2fa_enabled,
+    	]);
 
     	return response()->json([
-            'refresh_token' => $newRefreshToken,
-            'access_token' => $newAccessToken
-        ], 200)
-            ->cookie('access_token', $newAccessToken, $tokenRequestDTO->accessTokenExpiresIn)
-            ->cookie('refresh_token', $newRefreshToken, $tokenRequestDTO->refreshTokenExpiresIn);
+            'message' => $request->is_2fa_enabled ? '2FA enabled successfully' : '2FA disabled successfully'
+    	], 200);
     }
 
-    function refreshToken(Request $request)
+    public function refreshToken(Request $request)
     {
-        $tokenRequestDTO = TokenRequestDTO::fromRequest($request);
-        $userId = Redis::get('refresh_token:' . $tokenRequestDTO->refreshToken);
-
-        if (!$userId)
-	{
-            return response()->json(['message' => 'Invalid refresh token'], 401);
-    	}
-
-    	if ($tokenRequestDTO->accessToken)
-	{
-            Redis::del('access_token:' . $tokenRequestDTO->accessToken);
-            Redis::lrem('user_access_tokens:' . $userId, 1, $tokenRequestDTO->accessToken);
-    	}
+    	$userId = $request->attributes->get('userId');
 
     	$newAccessToken = $this->createToken($userId, 'access');
 
-        return response()->json([
+    	return response()->json([
             'access_token' => $newAccessToken
-    	], 200)->cookie('access_token', $newAccessToken, $tokenRequestDTO->accessTokenExpiresIn);
+    	], 200);
     }
 
     public function logout(Request $request)
     {
-    	$tokenRequestDTO = TokenRequestDTO::fromRequest($request);
+    	$accessToken = $request->attributes->get('accessToken');
+    	$userIdAccess = $request->attributes->get('userId');
 
-    	$userIdAccess = Redis::get('access_token:' . $tokenRequestDTO->accessToken);
-    	$userIdRefresh = Redis::get('refresh_token:' . $tokenRequestDTO->refreshToken);
+        Redis::del('access_token:' . $accessToken);
+        Redis::lrem('user_access_tokens:' . $userIdAccess, 1, $accessToken);
+        Redis::expire('user_access_tokens:' . $userIdAccess, 3600);
 
-    	$accessTokenDTO = TokenDTO::fromRequest($userIdAccess, 'access');
-    	$refreshTokenDTO = TokenDTO::fromRequest($userIdRefresh, 'refresh');
-
-   	Redis::del('access_token:' . $tokenRequestDTO->accessToken);
-    	Redis::del('refresh_token:' . $tokenRequestDTO->refreshToken);
-    	Redis::lrem('user_access_tokens:' . $accessTokenDTO->userId, 1, $tokenRequestDTO->accessToken);
-    	Redis::lrem('user_refresh_tokens:' . $refreshTokenDTO->userId, 1, $tokenRequestDTO->refreshToken);
-    	Redis::expire('user_refresh_tokens:' . $refreshTokenDTO->userId, $refreshTokenDTO->tokenExpiresIn);
-    	Redis::expire('user_access_tokens:' . $accessTokenDTO->userId, $accessTokenDTO->tokenExpiresIn);
-
-        return response()->json(['message' => 'Logged out successfully'], 200)
-            ->cookie('access_token', '', -1)
-            ->cookie('refresh_token', '', -1);
+    	return response()->json(['message' => 'Logged out successfully'], 200);
     }
 
     public function logoutAll(Request $request)
     {
-    	$tokenRequestDTO = TokenRequestDTO::fromRequest($request);
+    	$userIdAccess = $request->attributes->get('userId');
+    	$userAccessTokens = Redis::lrange('user_access_tokens:' . $userIdAccess, 0, -1);
 
-    	$userIdAccess = Redis::get('access_token:' . $tokenRequestDTO->accessToken);
-    	$userIdRefresh = Redis::get('refresh_token:' . $tokenRequestDTO->refreshToken);
-
-    	$accessTokenDTO = TokenDTO::fromRequest($userIdAccess, 'access');
-    	$refreshTokenDTO = TokenDTO::fromRequest($userIdRefresh, 'refresh');
-
-    	$userAccessTokens = Redis::lrange('user_access_tokens:' . $accessTokenDTO->userId, 0, -1);
-    	$userRefreshTokens = Redis::lrange('user_refresh_tokens:' . $refreshTokenDTO->userId, 0, -1);
-
-    	foreach ($userAccessTokens as $token)
-	{
+    	foreach ($userAccessTokens as $token) {
             Redis::del('access_token:' . $token);
     	}
 
-    	foreach ($userRefreshTokens as $token)
-	{
-            Redis::del('refresh_token:' . $token);
-    	}
+    	Redis::del('user_access_tokens:' . $userIdAccess);
 
-    	Redis::del('user_access_tokens:' . $accessTokenDTO->userId);
-    	Redis::del('user_refresh_tokens:' . $refreshTokenDTO->userId);
-
-    	return response()->json(['message' => 'Logged out ALL successfully'], 200)
-            ->cookie('access_token', '', -1)
-            ->cookie('refresh_token', '', -1);
+    	return response()->json(['message' => 'Logged out ALL successfully'], 200);
     }
 
     public function getToken(Request $request)
     {
-    	$tokenRequestDTO = TokenRequestDTO::fromRequest($request);
-    	$userId = Redis::get('access_token:' . $tokenRequestDTO->accessToken);
+    	$userId = $request->attributes->get('userId');
 
     	$user = User::find($userId);
-    	$tokenDTO = TokenDTO::fromRequest($userId, 'access');
+
+    	if (!$user) {
+            return response()->json(['message' => 'User not found'], 404);
+        }
 
     	return response()->json([
-            'id' => $user->id,
             'name' => $user->name,
             'email' => $user->email,
-	    'token' => $tokenRequestDTO->accessToken,
-	    'type' => $tokenDTO->tokenType
     	], 200);
     }
 
     public function getAllToken(Request $request)
     {
-    	$tokenRequestDTO = TokenRequestDTO::fromRequest($request);
-    	$userId = Redis::get('access_token:' . $tokenRequestDTO->accessToken);
+    	$userId = $request->attributes->get('userId');
 
     	$accessTokens = Redis::lrange('user_access_tokens:' . $userId, 0, -1);
-    	$refreshTokens = Redis::lrange('user_refresh_tokens:' . $userId, 0, -1);
 
     	$validAccessTokens = [];
-    	$validRefreshTokens = [];
 
         foreach ($accessTokens as $token) {
             $userIdInRedis = Redis::get('access_token:' . $token);
@@ -169,62 +246,55 @@ class AuthenticationController extends Controller
             if ($userIdInRedis) {
                 $validAccessTokens[] = $token;
             } else {
-                Redis::lrem('user_access_tokens:' . $userId, 0, $token);
-            }
-    	}
-
-    	foreach ($refreshTokens as $token) {
-            $userIdInRedis = Redis::get('refresh_token:' . $token);
-
-            if ($userIdInRedis) {
-                $validRefreshTokens[] = $token;
-            } else {
-                Redis::lrem('user_refresh_tokens:' . $userId, 0, $token);
+            	Redis::lrem('user_access_tokens:' . $userId, 0, $token);
             }
     	}
 
     	return response()->json([
             'access_tokens' => $validAccessTokens,
-            'refresh_tokens' => $validRefreshTokens,
     	], 200);
     }
 
     public function changePassword(ChangePassword $request)
     {
-	$tokenRequestDTO = TokenRequestDTO::fromRequest($request);
-	$ChangePasswordDTO = ChangePasswordDTO::fromRequest($request);
+    	$changePasswordDTO = ChangePasswordDTO::fromRequest($request);
 
-	$userId = Redis::get('access_token:' . $tokenRequestDTO->accessToken);
+    	$userId = $request->attributes->get('userId');
 
-        $user = User::where('id', $userId)->first();
+	$user = User::find($userId);
 
-        if (!Hash::check($ChangePasswordDTO->oldPassword, $user->password)) {
+    	if (!$user) {
+            return response()->json(['message' => 'User not found'], 404);
+    	}
+
+    	if (!Hash::check($changePasswordDTO->oldPassword, $user->password)) {
             return response()->json(['message' => 'Invalid password'], 401);
-        }
+    	}
 
-	$user->password = Hash::make($ChangePasswordDTO->newPassword);
-	$user->save();
+    	$user->password = Hash::make($changePasswordDTO->newPassword);
+    	$user->save();
 
-	return response()->json(['message' => 'Password updated successfully'], 200);
+    	return response()->json(['message' => 'Password updated successfully'], 200);
     }
 
-    public function createToken($userId, $tokenType)
+    private function createToken($userId, $tokenType)
     {
-        $tokenDTO = TokenDTO::fromRequest($userId, $tokenType);
-        $tokenCount = Redis::llen('user_' . $tokenType . '_tokens:' . $tokenDTO->userId);
+    	$tokenDTO = TokenDTO::fromRequest($userId, $tokenType);
+    	$tokenCount = Redis::llen('user_' . $tokenType . '_tokens:' . $tokenDTO->userId);
 
-        if ($tokenCount >= $tokenDTO->maxActiveTokens)
-        {
+    	while ($tokenCount >= $tokenDTO->maxActiveTokens) {
             $oldToken = Redis::rpop('user_' . $tokenType . '_tokens:' . $tokenDTO->userId);
             Redis::del($tokenType . '_token:' . $oldToken);
-        }
+            $tokenCount--;
+    	}
 
-        Redis::setex($tokenType . '_token:' . $tokenDTO->token, $tokenDTO->tokenExpiresIn, $tokenDTO->userId);
-        Redis::lpush('user_' . $tokenType . '_tokens:' . $tokenDTO->userId, $tokenDTO->token);
-        Redis::expire('user_' . $tokenType . '_tokens:' . $tokenDTO->userId, $tokenDTO->tokenExpiresIn);
+    	$hashedToken = hash('sha256', $tokenDTO->token);
+    	Redis::setex($tokenType . '_token:' . $hashedToken, $tokenDTO->tokenExpiresIn, $tokenDTO->userId);
+    	Redis::lpush('user_' . $tokenType . '_tokens:' . $tokenDTO->userId, $hashedToken);
+    	Redis::expire('user_' . $tokenType . '_tokens:' . $tokenDTO->userId, $tokenDTO->tokenExpiresIn);
 
-        return $tokenDTO->token;
+    	return $tokenDTO->token;
     }
 
-}
 
+}
