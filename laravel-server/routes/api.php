@@ -8,13 +8,19 @@ use App\Http\Controllers\RoleController;
 use App\Http\Controllers\PermissionController;
 use App\Http\Controllers\UserController;
 use App\Http\Controllers\ChangeLogController;
-Route::post('/auth/login',[AuthenticationController::class,'login']);
+use App\Http\Controllers\GitHookController;
+use App\Http\Controllers\Proverka;
 
+Route::post('/auth/login',[AuthenticationController::class,'login']);
+Route::get('/proverka',[Proverka::class,'proverka']);
 Route::middleware(\App\Http\Middleware\EnsureUserLoggedOut::class)->post('/auth/register', [AuthenticationController::class, 'register']);
 
 Route::middleware(\App\Http\Middleware\CheckRefreshToken::class)->post('/auth/refresh', [AuthenticationController::class, 'refreshToken']);
 
 Route::middleware(\App\Http\Middleware\CheckAccessToken::class)->group(function () {
+
+    Route::middleware(\App\Http\Middleware\CheckPermission::class . ':update-project')
+        ->post('/hooks/git', [GitHookController::class, 'updateProject']);
 
     Route::post('/auth/out',[AuthenticationController::class,'logout']);
     Route::post('/auth/out_all',[AuthenticationController::class,'logoutAll']);
